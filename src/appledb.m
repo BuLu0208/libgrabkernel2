@@ -203,7 +203,11 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
         return nil;
     }
     
-    NSData *data = [compressed gunzippedData];
+    NSData *data = [compressed isGzippedData] ? [compressed decompressGzippedData:&error] : compressed;
+    if (error) {
+        ERRLOG("Failed to decompress firmware list: %s\n", error.localizedDescription.UTF8String);
+        return nil;
+    }
     if (!data) {
         ERRLOG("Failed to decompress firmware list\n");
         return nil;
