@@ -4,6 +4,8 @@
 //
 //  Created by Dhinak G on 3/4/24.
 //
+// 本文件主要负责从Apple的固件服务器获取内核缓存文件
+// 实现了固件URL的获取、验证和选择最佳下载源的功能
 
 #import <Foundation/Foundation.h>
 #import <sys/utsname.h>
@@ -13,15 +15,21 @@
 #import <sys/sysctl.h>
 #import "utils.h"
 
-#define BASE_URL @"https://api.appledb.dev/ios/"
-#define ALL_VERSIONS BASE_URL @"main.json.xz"
+// IPSW.me API的基础URL
+#define BASE_URL @"https://api.ipsw.me/v4/"
+// 获取所有设备固件信息的API端点
+#define ALL_VERSIONS BASE_URL @"devices"
 
+// 需要开发者账号认证的Apple下载服务器列表
 NSArray *hostsNeedingAuth = @[@"adcdownload.apple.com", @"download.developer.apple.com", @"developer.apple.com"];
 
-static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
-    return [NSString stringWithFormat:@"https://api.appledb.dev/ios/%@;%@.json", osStr, build];
+// 根据设备标识符构建API URL
+static inline NSString *apiURLForBuild(NSString *osStr) {
+    return [NSString stringWithFormat:@"https://api.ipsw.me/v4/device/%@", osStr];
 }
 
+// 执行同步HTTP请求
+// 使用信号量确保异步网络请求同步完成
 static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block NSData *data = nil;
@@ -45,6 +53,11 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     return data;
 }
 
+// 从多个固件源中选择最佳的下载链接
+// 会检查设备兼容性、链接有效性，并优先选择非需要认证的源
+// sources: 固件源列表
+// modelIdentifier: 设备型号标识符
+// isOTA: 输出参数，标识是否为OTA更新包
 static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier, bool *isOTA) {
     for (NSDictionary<NSString *, id> *source in sources) {
         if (![source[@"deviceMap"] containsObject:modelIdentifier]) {
@@ -88,6 +101,12 @@ static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *so
     return nil;
 }
 
+// 从所有设备固件列表中查找指定版本的固件URL
+// 这是一个备用方法，当直接API查询失败时使用
+// osStr: 设备标识符
+// build: 系统构建版本号
+// modelIdentifier: 设备型号标识符
+// isOTA: 输出参数，标识是否为OTA更新包
 static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
     NSError *error = nil;
     NSData *compressed = makeSynchronousRequest(ALL_VERSIONS, &error);
@@ -122,8 +141,14 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
     return nil;
 }
 
+// 直接从设备专用API获取固件URL
+// 这是首选方法，速度更快，数据量更小
+// osStr: 设备标识符
+// build: 系统构建版本号
+// modelIdentifier: 设备型号标识符
+// isOTA: 输出参数，标识是否为OTA更新包
 static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *apiURL = apiURLForBuild(osStr, build);
+    NSString *apiURL = apiURLForBuild(osStr);
     if (!apiURL) {
         ERRLOG("Failed to get API URL!\n");
         return nil;
@@ -136,20 +161,30 @@ static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSSt
         return nil;
     }
 
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    NSArray *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
     if (error) {
         ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
         return nil;
     }
 
-    NSString *firmwareURL = bestLinkFromSources(json[@"sources"], modelIdentifier, isOTA);
-    if (!firmwareURL) {
-        return nil;
+    for (NSDictionary *firmware in json) {
+        if ([firmware[@"buildid"] isEqualToString:build]) {
+            NSString *firmwareURL = bestLinkFromSources(firmware[@"sources"], modelIdentifier, isOTA);
+            if (firmwareURL) {
+                return firmwareURL;
+            }
+        }
     }
 
-    return firmwareURL;
+    return nil;
 }
 
+// 获取指定设备和版本的固件URL
+// 首先尝试直接API，如果失败则尝试从所有版本列表中查找
+// osStr: 设备标识符
+// build: 系统构建版本号
+// modelIdentifier: 设备型号标识符
+// isOTA: 输出参数，标识是否为OTA更新包
 NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
     NSString *firmwareURL = getFirmwareURLFromDirect(osStr, build, modelIdentifier, isOTA);
     if (!firmwareURL) {
@@ -165,6 +200,9 @@ NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIde
     return firmwareURL;
 }
 
+// 获取当前设备当前系统版本的固件URL
+// 自动获取设备信息，简化调用过程
+// isOTA: 输出参数，标识是否为OTA更新包
 NSString *getFirmwareURL(bool *isOTA) {
     NSString *osStr = getOsStr();
     NSString *build = getBuild();
