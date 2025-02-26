@@ -29,7 +29,6 @@ jobs:
 
       - name: Build libgrabkernel2
         run: |
-          cd libgrabkernel2
           make TARGET=ios DISABLE_TESTS=1 STATIC_ONLY=1
       - name: Upload libgrabkernel2
         uses: actions/upload-artifact@v4
