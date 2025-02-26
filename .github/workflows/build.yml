@@ -1,0 +1,38 @@
+name: Build libgrabkernel2
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create Directory Structure
+      run: |
+        mkdir -p src include _external/include _external/lib/ios
+        
+    - name: Setup Dependencies
+      run: |
+        # 安装 libpartial 依赖
+        git clone https://github.com/dhinakg/libpartial.git
+        cd libpartial
+        make
+        cp build/ios/lib/libpartial.dylib ../_external/lib/ios/
+        cp include/partial.h ../_external/include/
+        cd ..
+        
+    - name: Build Static Library
+      run: |
+        make TARGET=ios DISABLE_TESTS=1
+        
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: libgrabkernel2
+        path: output/ios/lib/libgrabkernel2.a
