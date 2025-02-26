@@ -50,40 +50,39 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     
     NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
                                         completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
+                                            if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+                                                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+                                                if (httpResponse.statusCode != 200) {
+                                                    if (error == nil) {
+                                                        error = [NSError errorWithDomain:NSURLErrorDomain
+                                                                                 code:httpResponse.statusCode
+                                                                             userInfo:@{NSLocalizedDescriptionKey: @"HTTP error"}];
+                                                    }
+                                                    taskData = nil;
+                                                }
+                                            }
                                             data = taskData;
                                             taskError = error;
                                             dispatch_semaphore_signal(semaphore);
                                         }];
     
-    // 使用代理方法监控下载进度
-    [session addObserver:session
-               forKeyPath:@"currentRequest.countOfBytesReceived"
-                  options:NSKeyValueObservingOptionNew
-                  context:NULL];
-    
-    // 实现KVO回调
-    [session observeValueForKeyPath:@"currentRequest.countOfBytesReceived"
-                         ofObject:task
-                           change:nil
-                          context:NULL];
-    
-    // 使用代理方法监控进度
+    // 设置进度监听
     [task addObserver:task
-           forKeyPath:@"countOfBytesReceived"
+           forKeyPath:NSStringFromSelector(@selector(countOfBytesReceived))
               options:NSKeyValueObservingOptionNew
               context:NULL];
     
-    // 实现进度通知
-    [[NSNotificationCenter defaultCenter] addObserverForName:NSURLSessionTaskDidSendBodyDataNotification
-                                                    object:task
-                                                     queue:[NSOperationQueue mainQueue]
-                                                usingBlock:^(NSNotification *note) {
-        int64_t totalBytesWritten = [note.userInfo[NSURLSessionTaskBytesSentKey] longLongValue];
-        int64_t totalBytesExpectedToWrite = [note.userInfo[NSURLSessionTaskTotalBytesSentKey] longLongValue];
-        
-        receivedBytes = totalBytesWritten;
-        totalBytes = totalBytesExpectedToWrite;
-        float progress = totalBytesExpectedToWrite > 0 ? (float)totalBytesWritten / totalBytesExpectedToWrite : 0;
+    // 实现KVO回调
+    [task observeValueForKeyPath:NSStringFromSelector(@selector(countOfBytesReceived))
+                      ofObject:task
+                        change:@{NSKeyValueChangeNewKey: @(task.countOfBytesReceived)}
+                       context:NULL];
+    
+    // 发送进度通知
+    if (task.countOfBytesExpectedToReceive > 0) {
+        receivedBytes = task.countOfBytesReceived;
+        totalBytes = task.countOfBytesExpectedToReceive;
+        float progress = (float)receivedBytes / totalBytes;
         
         [[NSNotificationCenter defaultCenter] postNotificationName:@"DownloadProgressUpdated"
                                                         object:nil
@@ -92,7 +91,7 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
                                                           @"receivedBytes": @(receivedBytes),
                                                           @"totalBytes": @(totalBytes)
                                                       }];
-    }];
+    }
     
     [task resume];
     
