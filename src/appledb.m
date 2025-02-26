@@ -23,9 +23,9 @@
 // 需要开发者账号认证的Apple下载服务器列表
 NSArray *hostsNeedingAuth = @[@"adcdownload.apple.com", @"download.developer.apple.com", @"developer.apple.com"];
 
-// 根据设备标识符构建API URL
-static inline NSString *apiURLForBuild(NSString *osStr) {
-    return [NSString stringWithFormat:@"https://api.ipsw.me/v4/device/%@", osStr];
+// 根据设备标识符和构建版本号构建直接下载URL
+static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
+    return [NSString stringWithFormat:@"https://api.ipsw.me/v4/ipsw/download/%@/%@", osStr, build];
 }
 
 // 执行同步HTTP请求
@@ -193,72 +193,24 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
     return nil;
 }
 
-// 直接从设备专用API获取固件URL
-// 这是首选方法，速度更快，数据量更小
+// 直接从API获取固件下载URL
+// 这是首选方法，直接获取下载链接
 // osStr: 设备标识符
 // build: 系统构建版本号
 // modelIdentifier: 设备型号标识符
 // isOTA: 输出参数，标识是否为OTA更新包
 static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *apiURL = apiURLForBuild(osStr);
+    NSString *apiURL = apiURLForBuild(osStr, build);
     if (!apiURL) {
         ERRLOG("Failed to get API URL!\n");
         return nil;
     }
 
-    NSError *error = nil;
-    NSData *data = makeSynchronousRequest(apiURL, &error);
-    if (error) {
-        ERRLOG("Failed to fetch API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
+    if (isOTA) {
+        *isOTA = NO; // 直接下载链接总是返回完整固件，而不是OTA更新包
     }
 
-    if (!data) {
-        ERRLOG("Received empty data from API\n");
-        return nil;
-    }
-
-    NSArray *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-    if (error) {
-        ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-
-    if (![json isKindOfClass:[NSArray class]]) {
-        ERRLOG("Unexpected API response format: not an array\n");
-        return nil;
-    }
-
-    DBGLOG("Searching for build %s in %lu firmware entries\n", build.UTF8String, (unsigned long)json.count);
-
-    for (NSDictionary *firmware in json) {
-        if (![firmware isKindOfClass:[NSDictionary class]]) {
-            DBGLOG("Skipping invalid firmware entry (not a dictionary)\n");
-            continue;
-        }
-
-        NSString *buildId = firmware[@"buildid"];
-        if (![buildId isKindOfClass:[NSString class]]) {
-            DBGLOG("Skipping firmware entry with invalid buildid\n");
-            continue;
-        }
-
-        if ([buildId isEqualToString:build]) {
-            NSArray *sources = firmware[@"sources"];
-            if (![sources isKindOfClass:[NSArray class]]) {
-                DBGLOG("Firmware entry has invalid sources format\n");
-                continue;
-            }
-
-            NSString *firmwareURL = bestLinkFromSources(sources, modelIdentifier, isOTA);
-            if (firmwareURL) {
-                return firmwareURL;
-            }
-        }
-    }
-
-    DBGLOG("No matching firmware found for build %s\n", build.UTF8String);
-    return nil;
+    return apiURL;
 }
 
 // 获取指定设备和版本的固件URL
