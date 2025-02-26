@@ -4,6 +4,8 @@
 //
 //  Created by Alfie on 14/02/2024.
 //
+// 本文件实现了从iOS固件中提取内核缓存的核心功能
+// 包括下载固件、解压缩、提取内核缓存等操作
 
 #include "grabkernel.h"
 #include <Foundation/Foundation.h>
@@ -122,6 +124,10 @@ bool grab_kernelcache(NSString *outPath) {
 
 // libgrabkernel compatibility shim
 // Note that research kernel grabbing is not currently supported
+// 兼容旧版libgrabkernel的接口
+// downloadPath: 下载路径
+// isResearchKernel: 是否为研究用内核(当前不支持)
+// 返回值: 0表示成功，其他值表示失败
 int grabkernel(char *downloadPath, int isResearchKernel __unused) {
     NSString *outPath = [NSString stringWithCString:downloadPath encoding:NSUTF8StringEncoding];
     return grab_kernelcache(outPath) ? 0 : -1;
