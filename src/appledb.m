@@ -34,22 +34,54 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block NSData *data = nil;
     __block NSError *taskError = nil;
-    NSURLSession *session = [NSURLSession sharedSession];
-
+    __block int64_t totalBytes = 0;
+    __block int64_t receivedBytes = 0;
+    
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.timeoutIntervalForRequest = 60.0;  // 设置请求超时时间为60秒
+    config.timeoutIntervalForResource = 800.0;  // 设置资源下载超时时间为1小时
+    
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config
+                                                       delegate:[[NSURLSessionDownloadDelegate alloc] init]
+                                                  delegateQueue:[NSOperationQueue mainQueue]];
+    
     NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
                                         completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
                                             data = taskData;
                                             taskError = error;
                                             dispatch_semaphore_signal(semaphore);
                                         }];
+    
+    // 添加下载进度监听
+    [task addObserver:task
+           forKeyPath:@"countOfBytesReceived"
+              options:NSKeyValueObservingOptionNew
+              context:NULL];
+    
+    // 实现进度回调
+    [task setDownloadProgressBlock:^(int64_t bytesWritten, int64_t totalBytesWritten, int64_t totalBytesExpectedToWrite) {
+        receivedBytes = totalBytesWritten;
+        totalBytes = totalBytesExpectedToWrite;
+        float progress = (float)totalBytesWritten / totalBytesExpectedToWrite;
+        
+        // 发送进度通知
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"DownloadProgressUpdated"
+                                                        object:nil
+                                                      userInfo:@{
+                                                          @"progress": @(progress),
+                                                          @"receivedBytes": @(receivedBytes),
+                                                          @"totalBytes": @(totalBytes)
+                                                      }];
+    }];
+    
     [task resume];
-
+    
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-
+    
     if (error) {
         *error = taskError;
     }
-
+    
     return data;
 }
 
