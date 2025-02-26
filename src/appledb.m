@@ -41,11 +41,8 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     config.timeoutIntervalForRequest = 60.0;  // 设置请求超时时间为60秒
     config.timeoutIntervalForResource = 800.0;  // 设置资源下载超时时间为1小时
     
-    // 创建自定义代理对象来处理下载进度
-    id<NSURLSessionDataDelegate> delegate = [[NSObject alloc] init];
-    
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config
-                                                       delegate:delegate
+                                                       delegate:nil
                                                   delegateQueue:[NSOperationQueue mainQueue]];
     
     NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
@@ -65,18 +62,6 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
                                             taskError = error;
                                             dispatch_semaphore_signal(semaphore);
                                         }];
-    
-    // 设置进度监听
-    [task addObserver:task
-           forKeyPath:NSStringFromSelector(@selector(countOfBytesReceived))
-              options:NSKeyValueObservingOptionNew
-              context:NULL];
-    
-    // 实现KVO回调
-    [task observeValueForKeyPath:NSStringFromSelector(@selector(countOfBytesReceived))
-                      ofObject:task
-                        change:@{NSKeyValueChangeNewKey: @(task.countOfBytesReceived)}
-                       context:NULL];
     
     // 发送进度通知
     if (task.countOfBytesExpectedToReceive > 0) {
