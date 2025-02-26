@@ -122,6 +122,23 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
 
     LOG("Downloading %s to %s...\n", kernelCachePath.UTF8String, outPath.UTF8String);
 
+    // 设置下载进度回调
+    [zip setProgressCallback:^(int64_t receivedBytes, int64_t totalBytes) {
+        float progress = (float)receivedBytes / totalBytes;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"DownloadProgressUpdated"
+                                                            object:nil
+                                                          userInfo:@{
+                                                              @"progress": @(progress),
+                                                              @"receivedBytes": @(receivedBytes),
+                                                              @"totalBytes": @(totalBytes)
+                                                          }];
+        });
+    }];
+
+    // 设置较长的超时时间(300秒)
+    [zip setTimeout:300];
+
     NSData *kernelCacheData = [zip getFileForPath:kernelCachePath error:&error];
     if (!kernelCacheData) {
         ERRLOG("Failed to download kernelcache! %s\n", error.localizedDescription.UTF8String);
