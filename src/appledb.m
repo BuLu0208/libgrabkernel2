@@ -1,285 +1,207 @@
 //
-//  appledb.m
+//  grabkernel.c
 //  libgrabkernel2
 //
-//  Created by Dhinak G on 3/4/24.
+//  Created by Alfie on 14/02/2024.
 //
-// 本文件主要负责从Apple的固件服务器获取内核缓存文件
-// 实现了固件URL的获取、验证和选择最佳下载源的功能
+// 本文件实现了从iOS固件中提取内核缓存的核心功能
+// 包括下载固件、解压缩、提取内核缓存等操作
 
-#import <Foundation/Foundation.h>
-#import <sys/utsname.h>
-#if !TARGET_OS_OSX
-#import <UIKit/UIKit.h>
-#endif
-#import <sys/sysctl.h>
-#import "utils.h"
+#include "grabkernel.h"
+#include <Foundation/Foundation.h>
+#include <partial/partial.h>
+#include <string.h>
+#include <sys/sysctl.h>
+#include "appledb.h"
+#include "utils.h"
 
-// IPSW.me API的基础URL
-#define BASE_URL @"https://api.ipsw.me/v4/"
-// 获取所有设备固件信息的API端点
-#define ALL_VERSIONS BASE_URL @"devices"
-
-// 需要开发者账号认证的Apple下载服务器列表
-NSArray *hostsNeedingAuth = @[@"adcdownload.apple.com", @"download.developer.apple.com", @"developer.apple.com"];
-
-// 根据设备标识符和构建版本号构建直接下载URL
-static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
-    return [NSString stringWithFormat:@"https://api.ipsw.me/v4/ipsw/download/%@/%@", osStr, build];
-}
-
-// 执行同步HTTP请求
-// 使用信号量确保异步网络请求同步完成
-static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-    __block NSData *data = nil;
-    __block NSError *taskError = nil;
-    __block int64_t totalBytes = 0;
-    __block int64_t receivedBytes = 0;
-    
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.timeoutIntervalForRequest = 60.0;  // 设置请求超时时间为60秒
-    config.timeoutIntervalForResource = 800.0;  // 设置资源下载超时时间为1小时
-    
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config
-                                                       delegate:nil
-                                                  delegateQueue:[NSOperationQueue mainQueue]];
-    
-    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
-                                        completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
-                                            if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-                                                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-                                                if (httpResponse.statusCode != 200) {
-                                                    if (error == nil) {
-                                                        error = [NSError errorWithDomain:NSURLErrorDomain
-                                                                                 code:httpResponse.statusCode
-                                                                             userInfo:@{NSLocalizedDescriptionKey: @"HTTP error"}];
-                                                    }
-                                                    taskData = nil;
-                                                }
-                                            }
-                                            data = taskData;
-                                            taskError = error;
-                                            dispatch_semaphore_signal(semaphore);
-                                        }];
-    
-    // 发送进度通知
-    if (task.countOfBytesExpectedToReceive > 0) {
-        receivedBytes = task.countOfBytesReceived;
-        totalBytes = task.countOfBytesExpectedToReceive;
-        float progress = (float)receivedBytes / totalBytes;
-        
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"DownloadProgressUpdated"
-                                                        object:nil
-                                                      userInfo:@{
-                                                          @"progress": @(progress),
-                                                          @"receivedBytes": @(receivedBytes),
-                                                          @"totalBytes": @(totalBytes)
-                                                      }];
-    }
-    
-    [task resume];
-    
-    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-    
-    if (error) {
-        *error = taskError;
-    }
-    
-    return data;
-}
-
-// 从多个固件源中选择最佳的下载链接
-// 会检查设备兼容性、链接有效性，并优先选择非需要认证的源
-// sources: 固件源列表
-// modelIdentifier: 设备型号标识符
-// isOTA: 输出参数，标识是否为OTA更新包
-static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier, bool *isOTA) {
-    if (!sources || ![sources isKindOfClass:[NSArray class]]) {
-        ERRLOG("Invalid sources parameter: null or not an array\n");
-        return nil;
+bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
+    if (!boardconfig || ![boardconfig isKindOfClass:[NSString class]]) {
+        ERRLOG("Invalid boardconfig parameter\n");
+        return false;
     }
 
-    if (!modelIdentifier || ![modelIdentifier isKindOfClass:[NSString class]]) {
-        ERRLOG("Invalid modelIdentifier parameter\n");
-        return nil;
-    }
-
-    DBGLOG("Searching for firmware in %lu sources\n", (unsigned long)sources.count);
-
-    for (NSDictionary<NSString *, id> *source in sources) {
-        if (![source isKindOfClass:[NSDictionary class]]) {
-            DBGLOG("Skipping invalid source (not a dictionary)\n");
-            continue;
-        }
-
-        NSArray *deviceMap = source[@"deviceMap"];
-        if (![deviceMap isKindOfClass:[NSArray class]]) {
-            DBGLOG("Skipping source with invalid deviceMap\n");
-            continue;
-        }
-
-        if (![deviceMap containsObject:modelIdentifier]) {
-            DBGLOG("Skipping source that does not include device: %s\n", [deviceMap componentsJoinedByString:@", "].UTF8String);
-            continue;
-        }
-
-        NSString *sourceType = source[@"type"];
-        if (![sourceType isKindOfClass:[NSString class]]) {
-            DBGLOG("Skipping source with invalid type\n");
-            continue;
-        }
-
-        if (![@[@"ota", @"ipsw"] containsObject:sourceType]) {
-            DBGLOG("Skipping source type: %s\n", [sourceType UTF8String]);
-            continue;
-        }
-
-        if ([sourceType isEqualToString:@"ota"] && source[@"prerequisiteBuild"]) {
-            DBGLOG("Skipping OTA source with prerequisite build: %s\n", [source[@"prerequisiteBuild"] UTF8String]);
-            continue;
-        }
-
-        NSArray *links = source[@"links"];
-        if (![links isKindOfClass:[NSArray class]]) {
-            DBGLOG("Skipping source with invalid links format\n");
-            continue;
-        }
-
-        for (NSDictionary<NSString *, id> *link in links) {
-            if (![link isKindOfClass:[NSDictionary class]]) {
-                DBGLOG("Skipping invalid link entry\n");
-                continue;
-            }
-
-            NSString *urlString = link[@"url"];
-            if (![urlString isKindOfClass:[NSString class]]) {
-                DBGLOG("Skipping link with invalid URL\n");
-                continue;
-            }
-
-            NSURL *url = [NSURL URLWithString:urlString];
-            if (!url) {
-                DBGLOG("Failed to parse URL: %s\n", [urlString UTF8String]);
-                continue;
-            }
-
-            if ([hostsNeedingAuth containsObject:url.host]) {
-                DBGLOG("Skipping link that needs authentication: %s\n", url.absoluteString.UTF8String);
-                continue;
-            }
-
-            NSNumber *active = link[@"active"];
-            if (![active isKindOfClass:[NSNumber class]] || !active.boolValue) {
-                DBGLOG("Skipping inactive link: %s\n", url.absoluteString.UTF8String);
-                continue;
-            }
-
-            if (isOTA) {
-                *isOTA = [sourceType isEqualToString:@"ota"];
-            }
-            LOG("Found firmware URL: %s (OTA: %s)\n", url.absoluteString.UTF8String, *isOTA ? "yes" : "no");
-            return urlString;
-        }
-
-        DBGLOG("No suitable links found for source: %s\n", [source[@"name"] UTF8String]);
-    }
-
-    ERRLOG("No suitable firmware URL found for device %s\n", modelIdentifier.UTF8String);
-    return nil;
-}
-
-// 从所有设备固件列表中查找指定版本的固件URL
-// 这是一个备用方法，当直接API查询失败时使用
-// osStr: 设备标识符
-// build: 系统构建版本号
-// modelIdentifier: 设备型号标识符
-// isOTA: 输出参数，标识是否为OTA更新包
-static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
     NSError *error = nil;
-    NSData *compressed = makeSynchronousRequest(ALL_VERSIONS, &error);
-    if (error) {
-        ERRLOG("Failed to fetch API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
+    NSString *pathPrefix = isOTA ? @"AssetData/boot" : @"";
+
+    if (!zipURL) {
+        ERRLOG("Missing firmware URL!\n");
+        return false;
     }
 
-    NSData *decompressed = [compressed decompressedDataUsingAlgorithm:NSDataCompressionAlgorithmLZMA error:&error];
-    if (error) {
-        ERRLOG("Failed to decompress API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
+    if (!outPath) {
+        ERRLOG("Missing output path!\n");
+        return false;
     }
 
-    NSArray *json = [NSJSONSerialization JSONObjectWithData:decompressed options:0 error:&error];
-    if (error) {
-        ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *outputDir = outPath.stringByDeletingLastPathComponent;
+    if (![fileManager isWritableFileAtPath:outputDir]) {
+        ERRLOG("Output directory is not writable: %s\n", outputDir.UTF8String);
+        return false;
     }
 
-    for (NSDictionary<NSString *, id> *firmware in json) {
-        if ([firmware[@"osStr"] isEqualToString:osStr] && [firmware[@"build"] isEqualToString:build]) {
-            NSString *firmwareURL = bestLinkFromSources(firmware[@"sources"], modelIdentifier, isOTA);
-            if (!firmwareURL) {
-                DBGLOG("No suitable links found for firmware: %s\n", [firmware[@"key"] UTF8String]);
-            } else {
-                return firmwareURL;
+    DBGLOG("Initializing partial zip download from %s\n", zipURL.UTF8String);
+    Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:zipURL] error:&error];
+    if (!zip) {
+        ERRLOG("Failed to open zip file! %s\n", error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    LOG("Downloading BuildManifest.plist...\n");
+    NSString *manifestPath = [pathPrefix stringByAppendingPathComponent:@"BuildManifest.plist"];
+    DBGLOG("Manifest path: %s\n", manifestPath.UTF8String);
+
+    NSData *buildManifestData = [zip getFileForPath:manifestPath error:&error];
+    if (!buildManifestData) {
+        ERRLOG("Failed to download BuildManifest.plist! %s\n", error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    DBGLOG("Parsing BuildManifest.plist...\n");
+    NSDictionary *buildManifest = [NSPropertyListSerialization propertyListWithData:buildManifestData options:0 format:NULL error:&error];
+    if (error) {
+        ERRLOG("Failed to parse BuildManifest.plist! %s\n", error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    NSString *kernelCachePath = nil;
+    NSArray *buildIdentities = buildManifest[@"BuildIdentities"];
+    if (![buildIdentities isKindOfClass:[NSArray class]]) {
+        ERRLOG("Invalid BuildIdentities format in manifest\n");
+        return false;
+    }
+
+    DBGLOG("Searching for kernelcache path for device: %s\n", boardconfig.UTF8String);
+    for (NSDictionary<NSString *, id> *identity in buildIdentities) {
+        if (![identity isKindOfClass:[NSDictionary class]]) {
+            DBGLOG("Skipping invalid build identity entry\n");
+            continue;
+        }
+
+        NSDictionary *info = identity[@"Info"];
+        if (![info isKindOfClass:[NSDictionary class]]) {
+            DBGLOG("Skipping build identity with invalid Info\n");
+            continue;
+        }
+
+        if ([info[@"Variant"] hasPrefix:@"Research"]) {
+            DBGLOG("Skipping Research variant\n");
+            continue;
+        }
+
+        if ([info[@"DeviceClass"] isEqualToString:boardconfig.lowercaseString]) {
+            NSDictionary *manifest = identity[@"Manifest"];
+            if (![manifest isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Invalid Manifest format in build identity\n");
+                continue;
             }
+
+            NSDictionary *kernelCache = manifest[@"KernelCache"];
+            if (![kernelCache isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Invalid KernelCache format in manifest\n");
+                continue;
+            }
+
+            NSDictionary *kernelInfo = kernelCache[@"Info"];
+            if (![kernelInfo isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Invalid KernelCache Info format\n");
+                continue;
+            }
+
+            kernelCachePath = [pathPrefix stringByAppendingPathComponent:kernelInfo[@"Path"]];
+            DBGLOG("Found kernelcache path: %s\n", kernelCachePath.UTF8String);
+            break;
         }
     }
 
-    return nil;
-}
-
-// 直接从API获取固件下载URL
-// 这是首选方法，直接获取下载链接
-// osStr: 设备标识符
-// build: 系统构建版本号
-// modelIdentifier: 设备型号标识符
-// isOTA: 输出参数，标识是否为OTA更新包
-static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *apiURL = apiURLForBuild(osStr, build);
-    if (!apiURL) {
-        ERRLOG("Failed to get API URL!\n");
-        return nil;
+    if (!kernelCachePath) {
+        ERRLOG("Failed to find kernelcache path in BuildManifest.plist!\n");
+        return false;
     }
 
-    if (isOTA) {
-        *isOTA = NO; // 直接下载链接总是返回完整固件，而不是OTA更新包
+    LOG("Downloading %s to %s...\n", kernelCachePath.UTF8String, outPath.UTF8String);
+
+    // 设置下载进度回调
+    [zip setProgressCallback:^(int64_t receivedBytes, int64_t totalBytes) {
+        float progress = (float)receivedBytes / totalBytes;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"DownloadProgressUpdated"
+                                                            object:nil
+                                                          userInfo:@{
+                                                              @"progress": @(progress),
+                                                              @"receivedBytes": @(receivedBytes),
+                                                              @"totalBytes": @(totalBytes)
+                                                          }];
+        });
+    }];
+
+    // 设置较长的超时时间(300秒)
+    [zip setTimeout:300];
+
+    NSData *kernelCacheData = [zip getFileForPath:kernelCachePath error:&error];
+    if (!kernelCacheData) {
+        ERRLOG("Failed to download kernelcache! %s\n", error.localizedDescription.UTF8String);
+        return false;
     }
 
-    return apiURL;
+    DBGLOG("Downloaded kernelcache data size: %lu bytes\n", (unsigned long)kernelCacheData.length);
+    if (kernelCacheData.length == 0) {
+        ERRLOG("Downloaded kernelcache is empty!\n");
+        return false;
+    }
+
+    LOG("Writing kernelcache to disk...\n");
+    if (![kernelCacheData writeToFile:outPath options:NSDataWritingAtomic error:&error]) {
+        ERRLOG("Failed to write kernelcache to %s! %s\n", outPath.UTF8String, error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    LOG("Successfully downloaded and saved kernelcache\n");
+    return true;
 }
 
-// 获取指定设备和版本的固件URL
-// 首先尝试直接API，如果失败则尝试从所有版本列表中查找
-// osStr: 设备标识符
-// build: 系统构建版本号
-// modelIdentifier: 设备型号标识符
-// isOTA: 输出参数，标识是否为OTA更新包
-NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *firmwareURL = getFirmwareURLFromDirect(osStr, build, modelIdentifier, isOTA);
+bool download_kernelcache(NSString *zipURL, bool isOTA, NSString *outPath) {
+    NSString *boardconfig = getBoardconfig();
+
+    if (!boardconfig) {
+        ERRLOG("Failed to get boardconfig!\n");
+        return false;
+    }
+
+    return download_kernelcache_for(boardconfig, zipURL, isOTA, outPath);
+}
+
+// TODO: Only require one of model identifier/boardconfig and use API to get the other?
+bool grab_kernelcache_for(NSString *osStr, NSString *build, NSString *modelIdentifier, NSString *boardconfig, NSString *outPath) {
+    bool isOTA = NO;
+    NSString *firmwareURL = getFirmwareURLFor(osStr, build, modelIdentifier, &isOTA);
     if (!firmwareURL) {
-        DBGLOG("Failed to get firmware URL from direct API, checking all versions...\n");
-        firmwareURL = getFirmwareURLFromAll(osStr, build, modelIdentifier, isOTA);
+        ERRLOG("Failed to get firmware URL!\n");
+        return false;
     }
 
-    if (!firmwareURL) {
-        ERRLOG("Failed to find a firmware URL!\n");
-        return nil;
-    }
-
-    return firmwareURL;
+    return download_kernelcache_for(boardconfig, firmwareURL, isOTA, outPath);
 }
 
-// 获取当前设备当前系统版本的固件URL
-// 自动获取设备信息，简化调用过程
-// isOTA: 输出参数，标识是否为OTA更新包
-NSString *getFirmwareURL(bool *isOTA) {
-    NSString *modelIdentifier = getModelIdentifier();
-    NSString *build = getBuild();
-
-    if (!modelIdentifier || !build) {
-        return nil;
+bool grab_kernelcache(NSString *outPath) {
+    bool isOTA = NO;
+    NSString *firmwareURL = getFirmwareURL(&isOTA);
+    if (!firmwareURL) {
+        ERRLOG("Failed to get firmware URL!\n");
+        return false;
     }
 
-    return getFirmwareURLFor(modelIdentifier, build, modelIdentifier, isOTA);
+    return download_kernelcache(firmwareURL, isOTA, outPath);
+}
+
+// libgrabkernel compatibility shim
+// Note that research kernel grabbing is not currently supported
+// 兼容旧版libgrabkernel的接口
+// downloadPath: 下载路径
+// isResearchKernel: 是否为研究用内核(当前不支持)
+// 返回值: 0表示成功，其他值表示失败
+int grabkernel(char *downloadPath, int isResearchKernel __unused) {
+    NSString *outPath = [NSString stringWithCString:downloadPath encoding:NSUTF8StringEncoding];
+    return grab_kernelcache(outPath) ? 0 : -1;
 }
