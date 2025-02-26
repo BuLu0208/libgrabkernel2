@@ -41,8 +41,11 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     config.timeoutIntervalForRequest = 60.0;  // 设置请求超时时间为60秒
     config.timeoutIntervalForResource = 800.0;  // 设置资源下载超时时间为1小时
     
+    // 创建自定义代理对象来处理下载进度
+    id<NSURLSessionDataDelegate> delegate = [[NSObject alloc] init];
+    
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config
-                                                       delegate:[[NSURLSessionDownloadDelegate alloc] init]
+                                                       delegate:delegate
                                                   delegateQueue:[NSOperationQueue mainQueue]];
     
     NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
@@ -52,19 +55,36 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
                                             dispatch_semaphore_signal(semaphore);
                                         }];
     
-    // 添加下载进度监听
+    // 使用代理方法监控下载进度
+    [session addObserver:session
+               forKeyPath:@"currentRequest.countOfBytesReceived"
+                  options:NSKeyValueObservingOptionNew
+                  context:NULL];
+    
+    // 实现KVO回调
+    [session observeValueForKeyPath:@"currentRequest.countOfBytesReceived"
+                         ofObject:task
+                           change:nil
+                          context:NULL];
+    
+    // 使用代理方法监控进度
     [task addObserver:task
            forKeyPath:@"countOfBytesReceived"
               options:NSKeyValueObservingOptionNew
               context:NULL];
     
-    // 实现进度回调
-    [task setDownloadProgressBlock:^(int64_t bytesWritten, int64_t totalBytesWritten, int64_t totalBytesExpectedToWrite) {
+    // 实现进度通知
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSURLSessionTaskDidSendBodyDataNotification
+                                                    object:task
+                                                     queue:[NSOperationQueue mainQueue]
+                                                usingBlock:^(NSNotification *note) {
+        int64_t totalBytesWritten = [note.userInfo[NSURLSessionTaskBytesSentKey] longLongValue];
+        int64_t totalBytesExpectedToWrite = [note.userInfo[NSURLSessionTaskTotalBytesSentKey] longLongValue];
+        
         receivedBytes = totalBytesWritten;
         totalBytes = totalBytesExpectedToWrite;
-        float progress = (float)totalBytesWritten / totalBytesExpectedToWrite;
+        float progress = totalBytesExpectedToWrite > 0 ? (float)totalBytesWritten / totalBytesExpectedToWrite : 0;
         
-        // 发送进度通知
         [[NSNotificationCenter defaultCenter] postNotificationName:@"DownloadProgressUpdated"
                                                         object:nil
                                                       userInfo:@{
