@@ -204,13 +204,12 @@ NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIde
 // 自动获取设备信息，简化调用过程
 // isOTA: 输出参数，标识是否为OTA更新包
 NSString *getFirmwareURL(bool *isOTA) {
-    NSString *osStr = getOsStr();
-    NSString *build = getBuild();
     NSString *modelIdentifier = getModelIdentifier();
+    NSString *build = getBuild();
 
-    if (!osStr || !build || !modelIdentifier) {
+    if (!modelIdentifier || !build) {
         return nil;
     }
 
-    return getFirmwareURLFor(osStr, build, modelIdentifier, isOTA);
+    return getFirmwareURLFor(modelIdentifier, build, modelIdentifier, isOTA);
 }
