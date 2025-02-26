@@ -4,6 +4,8 @@
 //
 //  Created by Alfie on 14/02/2024.
 //
+// 本文件实现了从iOS固件中提取内核缓存的核心功能
+// 包括下载固件、解压缩、提取内核缓存等操作
 
 #include "grabkernel.h"
 #include <Foundation/Foundation.h>
@@ -14,6 +16,11 @@
 #include "utils.h"
 
 bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
+    if (!boardconfig || ![boardconfig isKindOfClass:[NSString class]]) {
+        ERRLOG("Invalid boardconfig parameter\n");
+        return false;
+    }
+
     NSError *error = nil;
     NSString *pathPrefix = isOTA ? @"AssetData/boot" : @"";
 
@@ -27,11 +34,14 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
-    if (![[NSFileManager defaultManager] isWritableFileAtPath:outPath.stringByDeletingLastPathComponent]) {
-        ERRLOG("Output directory is not writable!\n");
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *outputDir = outPath.stringByDeletingLastPathComponent;
+    if (![fileManager isWritableFileAtPath:outputDir]) {
+        ERRLOG("Output directory is not writable: %s\n", outputDir.UTF8String);
         return false;
     }
 
+    DBGLOG("Initializing partial zip download from %s\n", zipURL.UTF8String);
     Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:zipURL] error:&error];
     if (!zip) {
         ERRLOG("Failed to open zip file! %s\n", error.localizedDescription.UTF8String);
@@ -39,13 +49,16 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
     }
 
     LOG("Downloading BuildManifest.plist...\n");
+    NSString *manifestPath = [pathPrefix stringByAppendingPathComponent:@"BuildManifest.plist"];
+    DBGLOG("Manifest path: %s\n", manifestPath.UTF8String);
 
-    NSData *buildManifestData = [zip getFileForPath:[pathPrefix stringByAppendingPathComponent:@"BuildManifest.plist"] error:&error];
+    NSData *buildManifestData = [zip getFileForPath:manifestPath error:&error];
     if (!buildManifestData) {
         ERRLOG("Failed to download BuildManifest.plist! %s\n", error.localizedDescription.UTF8String);
         return false;
     }
 
+    DBGLOG("Parsing BuildManifest.plist...\n");
     NSDictionary *buildManifest = [NSPropertyListSerialization propertyListWithData:buildManifestData options:0 format:NULL error:&error];
     if (error) {
         ERRLOG("Failed to parse BuildManifest.plist! %s\n", error.localizedDescription.UTF8String);
@@ -53,13 +66,52 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
     }
 
     NSString *kernelCachePath = nil;
+    NSArray *buildIdentities = buildManifest[@"BuildIdentities"];
+    if (![buildIdentities isKindOfClass:[NSArray class]]) {
+        ERRLOG("Invalid BuildIdentities format in manifest\n");
+        return false;
+    }
 
-    for (NSDictionary<NSString *, id> *identity in buildManifest[@"BuildIdentities"]) {
-        if ([identity[@"Info"][@"Variant"] hasPrefix:@"Research"]) {
+    DBGLOG("Searching for kernelcache path for device: %s\n", boardconfig.UTF8String);
+    for (NSDictionary<NSString *, id> *identity in buildIdentities) {
+        if (![identity isKindOfClass:[NSDictionary class]]) {
+            DBGLOG("Skipping invalid build identity entry\n");
             continue;
         }
-        if ([identity[@"Info"][@"DeviceClass"] isEqualToString:boardconfig.lowercaseString]) {
-            kernelCachePath = [pathPrefix stringByAppendingPathComponent:identity[@"Manifest"][@"KernelCache"][@"Info"][@"Path"]];
+
+        NSDictionary *info = identity[@"Info"];
+        if (![info isKindOfClass:[NSDictionary class]]) {
+            DBGLOG("Skipping build identity with invalid Info\n");
+            continue;
+        }
+
+        if ([info[@"Variant"] hasPrefix:@"Research"]) {
+            DBGLOG("Skipping Research variant\n");
+            continue;
+        }
+
+        if ([info[@"DeviceClass"] isEqualToString:boardconfig.lowercaseString]) {
+            NSDictionary *manifest = identity[@"Manifest"];
+            if (![manifest isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Invalid Manifest format in build identity\n");
+                continue;
+            }
+
+            NSDictionary *kernelCache = manifest[@"KernelCache"];
+            if (![kernelCache isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Invalid KernelCache format in manifest\n");
+                continue;
+            }
+
+            NSDictionary *kernelInfo = kernelCache[@"Info"];
+            if (![kernelInfo isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Invalid KernelCache Info format\n");
+                continue;
+            }
+
+            kernelCachePath = [pathPrefix stringByAppendingPathComponent:kernelInfo[@"Path"]];
+            DBGLOG("Found kernelcache path: %s\n", kernelCachePath.UTF8String);
+            break;
         }
     }
 
@@ -74,15 +126,21 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
     if (!kernelCacheData) {
         ERRLOG("Failed to download kernelcache! %s\n", error.localizedDescription.UTF8String);
         return false;
-    } else {
-        LOG("Downloaded kernelcache!\n");
     }
 
+    DBGLOG("Downloaded kernelcache data size: %lu bytes\n", (unsigned long)kernelCacheData.length);
+    if (kernelCacheData.length == 0) {
+        ERRLOG("Downloaded kernelcache is empty!\n");
+        return false;
+    }
+
+    LOG("Writing kernelcache to disk...\n");
     if (![kernelCacheData writeToFile:outPath options:NSDataWritingAtomic error:&error]) {
         ERRLOG("Failed to write kernelcache to %s! %s\n", outPath.UTF8String, error.localizedDescription.UTF8String);
         return false;
     }
 
+    LOG("Successfully downloaded and saved kernelcache\n");
     return true;
 }
 
@@ -122,6 +180,10 @@ bool grab_kernelcache(NSString *outPath) {
 
 // libgrabkernel compatibility shim
 // Note that research kernel grabbing is not currently supported
+// 兼容旧版libgrabkernel的接口
+// downloadPath: 下载路径
+// isResearchKernel: 是否为研究用内核(当前不支持)
+// 返回值: 0表示成功，其他值表示失败
 int grabkernel(char *downloadPath, int isResearchKernel __unused) {
     NSString *outPath = [NSString stringWithCString:downloadPath encoding:NSUTF8StringEncoding];
     return grab_kernelcache(outPath) ? 0 : -1;

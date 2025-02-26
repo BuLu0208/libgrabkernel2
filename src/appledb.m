@@ -59,45 +59,97 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
 // modelIdentifier: 设备型号标识符
 // isOTA: 输出参数，标识是否为OTA更新包
 static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier, bool *isOTA) {
+    if (!sources || ![sources isKindOfClass:[NSArray class]]) {
+        ERRLOG("Invalid sources parameter: null or not an array\n");
+        return nil;
+    }
+
+    if (!modelIdentifier || ![modelIdentifier isKindOfClass:[NSString class]]) {
+        ERRLOG("Invalid modelIdentifier parameter\n");
+        return nil;
+    }
+
+    DBGLOG("Searching for firmware in %lu sources\n", (unsigned long)sources.count);
+
     for (NSDictionary<NSString *, id> *source in sources) {
-        if (![source[@"deviceMap"] containsObject:modelIdentifier]) {
-            DBGLOG("Skipping source that does not include device: %s\n", [source[@"deviceMap"] componentsJoinedByString:@", "].UTF8String);
+        if (![source isKindOfClass:[NSDictionary class]]) {
+            DBGLOG("Skipping invalid source (not a dictionary)\n");
             continue;
         }
 
-        if (![@[@"ota", @"ipsw"] containsObject:source[@"type"]]) {
-            DBGLOG("Skipping source type: %s\n", [source[@"type"] UTF8String]);
+        NSArray *deviceMap = source[@"deviceMap"];
+        if (![deviceMap isKindOfClass:[NSArray class]]) {
+            DBGLOG("Skipping source with invalid deviceMap\n");
             continue;
         }
 
-        if ([source[@"type"] isEqualToString:@"ota"] && source[@"prerequisiteBuild"]) {
-            // ignore deltas
+        if (![deviceMap containsObject:modelIdentifier]) {
+            DBGLOG("Skipping source that does not include device: %s\n", [deviceMap componentsJoinedByString:@", "].UTF8String);
+            continue;
+        }
+
+        NSString *sourceType = source[@"type"];
+        if (![sourceType isKindOfClass:[NSString class]]) {
+            DBGLOG("Skipping source with invalid type\n");
+            continue;
+        }
+
+        if (![@[@"ota", @"ipsw"] containsObject:sourceType]) {
+            DBGLOG("Skipping source type: %s\n", [sourceType UTF8String]);
+            continue;
+        }
+
+        if ([sourceType isEqualToString:@"ota"] && source[@"prerequisiteBuild"]) {
             DBGLOG("Skipping OTA source with prerequisite build: %s\n", [source[@"prerequisiteBuild"] UTF8String]);
             continue;
         }
 
-        for (NSDictionary<NSString *, id> *link in source[@"links"]) {
-            NSURL *url = [NSURL URLWithString:link[@"url"]];
+        NSArray *links = source[@"links"];
+        if (![links isKindOfClass:[NSArray class]]) {
+            DBGLOG("Skipping source with invalid links format\n");
+            continue;
+        }
+
+        for (NSDictionary<NSString *, id> *link in links) {
+            if (![link isKindOfClass:[NSDictionary class]]) {
+                DBGLOG("Skipping invalid link entry\n");
+                continue;
+            }
+
+            NSString *urlString = link[@"url"];
+            if (![urlString isKindOfClass:[NSString class]]) {
+                DBGLOG("Skipping link with invalid URL\n");
+                continue;
+            }
+
+            NSURL *url = [NSURL URLWithString:urlString];
+            if (!url) {
+                DBGLOG("Failed to parse URL: %s\n", [urlString UTF8String]);
+                continue;
+            }
+
             if ([hostsNeedingAuth containsObject:url.host]) {
                 DBGLOG("Skipping link that needs authentication: %s\n", url.absoluteString.UTF8String);
                 continue;
             }
 
-            if (!link[@"active"]) {
+            NSNumber *active = link[@"active"];
+            if (![active isKindOfClass:[NSNumber class]] || !active.boolValue) {
                 DBGLOG("Skipping inactive link: %s\n", url.absoluteString.UTF8String);
                 continue;
             }
 
             if (isOTA) {
-                *isOTA = [source[@"type"] isEqualToString:@"ota"];
+                *isOTA = [sourceType isEqualToString:@"ota"];
             }
             LOG("Found firmware URL: %s (OTA: %s)\n", url.absoluteString.UTF8String, *isOTA ? "yes" : "no");
-            return link[@"url"];
+            return urlString;
         }
 
         DBGLOG("No suitable links found for source: %s\n", [source[@"name"] UTF8String]);
     }
 
+    ERRLOG("No suitable firmware URL found for device %s\n", modelIdentifier.UTF8String);
     return nil;
 }
 
@@ -161,21 +213,51 @@ static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSSt
         return nil;
     }
 
+    if (!data) {
+        ERRLOG("Received empty data from API\n");
+        return nil;
+    }
+
     NSArray *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
     if (error) {
         ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
         return nil;
     }
 
+    if (![json isKindOfClass:[NSArray class]]) {
+        ERRLOG("Unexpected API response format: not an array\n");
+        return nil;
+    }
+
+    DBGLOG("Searching for build %s in %lu firmware entries\n", build.UTF8String, (unsigned long)json.count);
+
     for (NSDictionary *firmware in json) {
-        if ([firmware[@"buildid"] isEqualToString:build]) {
-            NSString *firmwareURL = bestLinkFromSources(firmware[@"sources"], modelIdentifier, isOTA);
+        if (![firmware isKindOfClass:[NSDictionary class]]) {
+            DBGLOG("Skipping invalid firmware entry (not a dictionary)\n");
+            continue;
+        }
+
+        NSString *buildId = firmware[@"buildid"];
+        if (![buildId isKindOfClass:[NSString class]]) {
+            DBGLOG("Skipping firmware entry with invalid buildid\n");
+            continue;
+        }
+
+        if ([buildId isEqualToString:build]) {
+            NSArray *sources = firmware[@"sources"];
+            if (![sources isKindOfClass:[NSArray class]]) {
+                DBGLOG("Firmware entry has invalid sources format\n");
+                continue;
+            }
+
+            NSString *firmwareURL = bestLinkFromSources(sources, modelIdentifier, isOTA);
             if (firmwareURL) {
                 return firmwareURL;
             }
         }
     }
 
+    DBGLOG("No matching firmware found for build %s\n", build.UTF8String);
     return nil;
 }
 
