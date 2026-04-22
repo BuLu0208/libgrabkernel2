@@ -20,7 +20,7 @@
 // 固件代理：日本服务器（访问 Apple CDN 下载固件）
 // ============================================================
 #define PROXY_API_URL     @"http://124.221.171.80:9090"
-#define PROXY_FW_URL      @"https://43.167.239.73:8443"
+#define PROXY_FW_URL      @"https://fw.lengye.top:8443"
 // ============================================================
 
 #define BASE_URL @"https://api.appledb.dev/ios/"
