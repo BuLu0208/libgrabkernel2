@@ -3,6 +3,7 @@
 //  libgrabkernel2
 //
 //  Created by Dhinak G on 3/4/24.
+//  Modified: 添加腾讯云代理支持（端口9090），解决中国大陆网络问题
 //
 
 #import <Foundation/Foundation.h>
@@ -13,6 +14,13 @@
 #import <sys/sysctl.h>
 #import "utils.h"
 
+// ============================================================
+// 🔧 代理配置
+// 设置为空字符串 "" 则直连（不使用代理）
+// ============================================================
+#define PROXY_BASE_URL @"http://124.221.171.80:9090"
+// ============================================================
+
 #define BASE_URL @"https://api.appledb.dev/ios/"
 #define ALL_VERSIONS BASE_URL @"main.json.xz"
 
@@ -22,13 +30,43 @@ static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
     return [NSString stringWithFormat:@"https://api.appledb.dev/ios/%@;%@.json", osStr, build];
 }
 
+static inline BOOL isProxyEnabled(void) {
+    NSString *proxy = PROXY_BASE_URL;
+    return (proxy != nil && proxy.length > 0);
+}
+
+static NSString *proxyURL(NSString *originalURL) {
+    if (!isProxyEnabled()) return originalURL;
+    NSString *base = @"https://api.appledb.dev";
+    if ([originalURL hasPrefix:base]) {
+        NSString *path = [originalURL substringFromIndex:base.length];
+        return [NSString stringWithFormat:@"%@%@", PROXY_BASE_URL, path];
+    }
+    return originalURL;
+}
+
+static NSString *proxyFirmwareURL(NSString *originalURL) {
+    if (!isProxyEnabled()) return originalURL;
+    NSString *encoded = [originalURL stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    return [NSString stringWithFormat:@"%@/proxy?url=%@", PROXY_BASE_URL, encoded];
+}
+
 static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
+    NSString *requestURL = proxyURL(url);
+
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block NSData *data = nil;
     __block NSError *taskError = nil;
-    NSURLSession *session = [NSURLSession sharedSession];
 
-    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.timeoutIntervalForRequest = 30;
+    config.timeoutIntervalForResource = 120;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:requestURL]];
+    [request setValue:@"libgrabkernel2-proxy/2.0" forHTTPHeaderField:@"User-Agent"];
+
+    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:requestURL]
                                         completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
                                             data = taskData;
                                             taskError = error;
@@ -58,7 +96,6 @@ static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *so
         }
 
         if ([source[@"type"] isEqualToString:@"ota"] && source[@"prerequisiteBuild"]) {
-            // ignore deltas
             DBGLOG("Skipping OTA source with prerequisite build: %s\n", [source[@"prerequisiteBuild"] UTF8String]);
             continue;
         }
@@ -78,8 +115,10 @@ static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *so
             if (isOTA) {
                 *isOTA = [source[@"type"] isEqualToString:@"ota"];
             }
-            LOG("Found firmware URL: %s (OTA: %s)\n", url.absoluteString.UTF8String, *isOTA ? "yes" : "no");
-            return link[@"url"];
+
+            NSString *finalURL = proxyFirmwareURL(link[@"url"]);
+            LOG("Found firmware URL: %s (OTA: %s)\n", finalURL.UTF8String, *isOTA ? "yes" : "no");
+            return finalURL;
         }
 
         DBGLOG("No suitable links found for source: %s\n", [source[@"name"] UTF8String]);
