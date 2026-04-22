@@ -46,9 +46,10 @@ static NSString *proxyURL(NSString *originalURL) {
 }
 
 static NSString *proxyFirmwareURL(NSString *originalURL) {
-    if (!isProxyEnabled()) return originalURL;
-    NSString *encoded = [originalURL stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-    return [NSString stringWithFormat:@"%@/proxy?url=%@", PROXY_BASE_URL, encoded];
+    // Don't proxy firmware URLs - let the iOS device download directly
+    // from Apple's Chinese CDN partners (Kunlun/Kingsoft).
+    // The Chinese CDN only serves legitimate Apple devices.
+    return originalURL;
 }
 
 static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
