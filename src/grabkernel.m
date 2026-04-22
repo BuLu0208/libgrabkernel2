@@ -129,7 +129,7 @@ bool grab_kernelcache_for_build_number(NSString *build, NSString *outPath) {
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURLFor(getOsStr(), build, getModelIdentifier(), &isOTA);
     if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL for build number!\n\n", build.UTF8String);
+        ERRLOG("Failed to get firmware URL for build number: %s\n", build.UTF8String);
         return false;
     }
 
