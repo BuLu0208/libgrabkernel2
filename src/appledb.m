@@ -144,7 +144,7 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
         return nil;
     }
 
-    NSArray *json = [NSJSONSerialization JSONObjectWithData:decompressed options:0 format:&error];
+    NSArray *json = [NSJSONSerialization JSONObjectWithData:decompressed options:0 error:&error];
     if (error) {
         ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
         return nil;
