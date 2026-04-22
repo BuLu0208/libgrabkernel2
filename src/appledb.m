@@ -3,7 +3,7 @@
 //  libgrabkernel2
 //
 //  Created by Dhinak G on 3/4/24.
-//  Modified: 添加腾讯云代理支持（端口9090），解决中国大陆网络问题
+//  Modified: 分离 API/固件代理，API 走国内，固件走日本
 //
 
 #import <Foundation/Foundation.h>
@@ -16,9 +16,11 @@
 
 // ============================================================
 // 🔧 代理配置
-// 设置为空字符串 "" 则直连（不使用代理）
+// API 代理：国内服务器（访问 api.appledb.dev）
+// 固件代理：日本服务器（访问 Apple CDN 下载固件）
 // ============================================================
-#define PROXY_BASE_URL @"http://124.221.171.80:9090"
+#define PROXY_API_URL     @"http://124.221.171.80:9090"
+#define PROXY_FW_URL      @"http://43.167.239.73:9090"
 // ============================================================
 
 #define BASE_URL @"https://api.appledb.dev/ios/"
@@ -31,7 +33,7 @@ static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
 }
 
 static inline BOOL isProxyEnabled(void) {
-    NSString *proxy = PROXY_BASE_URL;
+    NSString *proxy = PROXY_API_URL;
     return (proxy != nil && proxy.length > 0);
 }
 
@@ -40,16 +42,16 @@ static NSString *proxyURL(NSString *originalURL) {
     NSString *base = @"https://api.appledb.dev";
     if ([originalURL hasPrefix:base]) {
         NSString *path = [originalURL substringFromIndex:base.length];
-        return [NSString stringWithFormat:@"%@%@", PROXY_BASE_URL, path];
+        return [NSString stringWithFormat:@"%@%@", PROXY_API_URL, path];
     }
     return originalURL;
 }
 
 static NSString *proxyFirmwareURL(NSString *originalURL) {
-    // Don't proxy firmware URLs - let the iOS device download directly
-    // from Apple's Chinese CDN partners (Kunlun/Kingsoft).
-    // The Chinese CDN only serves legitimate Apple devices.
-    return originalURL;
+    NSString *fwProxy = PROXY_FW_URL;
+    if (!fwProxy || fwProxy.length == 0) return originalURL;
+    NSString *encoded = [originalURL stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    return [NSString stringWithFormat:@"%@/proxy?url=%@", fwProxy, encoded];
 }
 
 static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
@@ -142,7 +144,7 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
         return nil;
     }
 
-    NSArray *json = [NSJSONSerialization JSONObjectWithData:decompressed options:0 error:&error];
+    NSArray *json = [NSJSONSerialization JSONObjectWithData:decompressed options:0 format:&error];
     if (error) {
         ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
         return nil;
