@@ -1,8 +1,9 @@
 //
-//  grabkernel.c
+//  grabkernel.m
 //  libgrabkernel2
 //
 //  Created by Alfie on 14/02/2024.
+//  Modified: 添加腾讯云代理支持（端口9090），解决中国大陆网络问题
 //
 
 #include "grabkernel.h"
@@ -12,6 +13,23 @@
 #include <sys/sysctl.h>
 #include "appledb.h"
 #include "utils.h"
+
+// ============================================================
+// 🔧 代理配置 - 与 appledb.m 保持一致
+// ============================================================
+#define PROXY_BASE_URL @"http://124.221.171.80:9090"
+// ============================================================
+
+static inline BOOL isProxyEnabledKC(void) {
+    NSString *proxy = PROXY_BASE_URL;
+    return (proxy != nil && proxy.length > 0);
+}
+
+static NSString *proxyFirmwareURLKC(NSString *originalURL) {
+    if (!isProxyEnabledKC()) return originalURL;
+    NSString *encoded = [originalURL stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    return [NSString stringWithFormat:@"%@/proxy?url=%@", PROXY_BASE_URL, encoded];
+}
 
 bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
     NSError *error = nil;
@@ -32,7 +50,12 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
-    Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:zipURL] error:&error];
+    NSString *proxiedURL = proxyFirmwareURLKC(zipURL);
+    if (![zipURL isEqualToString:proxiedURL]) {
+        LOG("Using proxy: %s\n", proxiedURL.UTF8String);
+    }
+
+    Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:proxiedURL] error:&error];
     if (!zip) {
         ERRLOG("Failed to open zip file! %s\n", error.localizedDescription.UTF8String);
         return false;
@@ -97,7 +120,6 @@ bool download_kernelcache(NSString *zipURL, bool isOTA, NSString *outPath) {
     return download_kernelcache_for(boardconfig, zipURL, isOTA, outPath);
 }
 
-// TODO: Only require one of model identifier/boardconfig and use API to get the other?
 bool grab_kernelcache_for(NSString *osStr, NSString *build, NSString *modelIdentifier, NSString *boardconfig, NSString *outPath) {
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURLFor(osStr, build, modelIdentifier, &isOTA);
@@ -124,15 +146,13 @@ bool grab_kernelcache_for_build_number(NSString *build, NSString *outPath) {
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURLFor(getOsStr(), build, getModelIdentifier(), &isOTA);
     if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL for build number!\n");
+        ERRLOG("Failed to get firmware URL for build number!\n\n", build.UTF8String);
         return false;
     }
 
     return download_kernelcache(firmwareURL, isOTA, outPath);
 }
 
-// libgrabkernel compatibility shim
-// Note that research kernel grabbing is not currently supported
 int grabkernel(char *downloadPath, int isResearchKernel __unused) {
     NSString *outPath = [NSString stringWithCString:downloadPath encoding:NSUTF8StringEncoding];
     return grab_kernelcache(outPath) ? 0 : -1;
