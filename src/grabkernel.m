@@ -14,22 +14,7 @@
 #include "appledb.h"
 #include "utils.h"
 
-// ============================================================
-// 🔧 代理配置 - 与 appledb.m 保持一致
-// ============================================================
-#define PROXY_BASE_URL @"http://124.221.171.80:9090"
-// ============================================================
-
-static inline BOOL isProxyEnabledKC(void) {
-    NSString *proxy = PROXY_BASE_URL;
-    return (proxy != nil && proxy.length > 0);
-}
-
-static NSString *proxyFirmwareURLKC(NSString *originalURL) {
-    if (!isProxyEnabledKC()) return originalURL;
-    NSString *encoded = [originalURL stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-    return [NSString stringWithFormat:@"%@/proxy?url=%@", PROXY_BASE_URL, encoded];
-}
+// Proxy is handled in appledb.m (proxyFirmwareURL)
 
 bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
     NSError *error = nil;
@@ -50,12 +35,10 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
-    NSString *proxiedURL = proxyFirmwareURLKC(zipURL);
-    if (![zipURL isEqualToString:proxiedURL]) {
-        LOG("Using proxy: %s\n", proxiedURL.UTF8String);
-    }
+    // firmware URL already proxied by appledb.m, use directly
+    NSString *zipURLForDownload = zipURL;
 
-    Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:proxiedURL] error:&error];
+    Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:zipURLForDownload] error:&error];
     if (!zip) {
         ERRLOG("Failed to open zip file! %s\n", error.localizedDescription.UTF8String);
         return false;
@@ -146,7 +129,7 @@ bool grab_kernelcache_for_build_number(NSString *build, NSString *outPath) {
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURLFor(getOsStr(), build, getModelIdentifier(), &isOTA);
     if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL for build number %s!\n\n", build.UTF8String);
+        ERRLOG("Failed to get firmware URL for build number!\n\n", build.UTF8String);
         return false;
     }
 
