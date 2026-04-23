@@ -80,10 +80,11 @@ NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIde
     for (NSDictionary *entry in index) {
         if ([entry[@"model"] isEqualToString:modelIdentifier] &&
             [entry[@"build"] isEqualToString:build]) {
-            NSString *url = entry[@"url"];
-            LOG("Found kernelcache: %s (%s)\n", modelIdentifier.UTF8String, entry[@"version"].UTF8String);
-            if (isOTA) *isOTA = NO;
-            return url;
+        NSString *url = (NSString *)entry[@"url"];
+        NSString *version = (NSString *)entry[@"version"];
+        LOG("Found kernelcache: %s (%s)\n", modelIdentifier.UTF8String, version.UTF8String);
+        if (isOTA) *isOTA = NO;
+        return url;
         }
     }
 
