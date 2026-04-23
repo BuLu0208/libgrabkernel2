@@ -3,60 +3,21 @@
 //  libgrabkernel2
 //
 //  Created by Dhinak G on 3/4/24.
-//  Modified: 分离 API/固件代理，API 走国内，固件走日本
+//  Modified: 走 GitHub Release 镜像下载 kernelcache，通过 Cloudflare Workers 代理加速
 //
 
 #import <Foundation/Foundation.h>
-#import <sys/utsname.h>
-#if !TARGET_OS_OSX
-#import <UIKit/UIKit.h>
-#endif
-#import <sys/sysctl.h>
 #import "utils.h"
 
 // ============================================================
-// 🔧 代理配置
-// API 代理：国内服务器（访问 api.appledb.dev）
-// 固件代理：日本服务器（访问 Apple CDN 下载固件）
+// 🔧 GitHub Release 镜像配置
 // ============================================================
-#define PROXY_API_URL     @"http://124.221.171.80:9090"
-#define PROXY_FW_URL      @"http://124.221.171.80:9090/fw-proxy"
+#define MIRROR_BASE_URL @"https://github.lengye.top/download"
+#define INDEX_IPHONE    MIRROR_BASE_URL @"/iphone-kernelcache/index_iphone.json"
+#define INDEX_IPAD      MIRROR_BASE_URL @"/ipad-kernelcache/index_ipad.json"
 // ============================================================
 
-#define BASE_URL @"https://api.appledb.dev/ios/"
-#define ALL_VERSIONS BASE_URL @"main.json.xz"
-
-NSArray *hostsNeedingAuth = @[@"adcdownload.apple.com", @"download.developer.apple.com", @"developer.apple.com"];
-
-static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
-    return [NSString stringWithFormat:@"https://api.appledb.dev/ios/%@;%@.json", osStr, build];
-}
-
-static inline BOOL isProxyEnabled(void) {
-    NSString *proxy = PROXY_API_URL;
-    return (proxy != nil && proxy.length > 0);
-}
-
-static NSString *proxyURL(NSString *originalURL) {
-    if (!isProxyEnabled()) return originalURL;
-    NSString *base = @"https://api.appledb.dev";
-    if ([originalURL hasPrefix:base]) {
-        NSString *path = [originalURL substringFromIndex:base.length];
-        return [NSString stringWithFormat:@"%@%@", PROXY_API_URL, path];
-    }
-    return originalURL;
-}
-
-static NSString *proxyFirmwareURL(NSString *originalURL) {
-    NSString *fwProxy = PROXY_FW_URL;
-    if (!fwProxy || fwProxy.length == 0) return originalURL;
-    NSString *encoded = [originalURL stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-    return [NSString stringWithFormat:@"%@/proxy?url=%@", fwProxy, encoded];
-}
-
-static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
-    NSString *requestURL = proxyURL(url);
-
+static NSData *fetchJSONSync(NSString *url, NSError **error) {
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block NSData *data = nil;
     __block NSError *taskError = nil;
@@ -66,145 +27,69 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     config.timeoutIntervalForResource = 120;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
 
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:requestURL]];
-    [request setValue:@"libgrabkernel2-proxy/2.0" forHTTPHeaderField:@"User-Agent"];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
+    [request setValue:@"libgrabkernel2-mirror/3.0" forHTTPHeaderField:@"User-Agent"];
 
-    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:requestURL]
-                                        completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
+    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
+                                        completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *err) {
                                             data = taskData;
-                                            taskError = error;
+                                            taskError = err;
                                             dispatch_semaphore_signal(semaphore);
                                         }];
     [task resume];
-
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
 
-    if (error) {
-        *error = taskError;
-    }
-
+    if (error) *error = taskError;
     return data;
 }
 
-static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier, bool *isOTA) {
-    for (NSDictionary<NSString *, id> *source in sources) {
-        if (![source[@"deviceMap"] containsObject:modelIdentifier]) {
-            DBGLOG("Skipping source that does not include device: %s\n", [source[@"deviceMap"] componentsJoinedByString:@", "].UTF8String);
-            continue;
-        }
-
-        if (![@[@"ota", @"ipsw"] containsObject:source[@"type"]]) {
-            DBGLOG("Skipping source type: %s\n", [source[@"type"] UTF8String]);
-            continue;
-        }
-
-        if ([source[@"type"] isEqualToString:@"ota"] && source[@"prerequisiteBuild"]) {
-            DBGLOG("Skipping OTA source with prerequisite build: %s\n", [source[@"prerequisiteBuild"] UTF8String]);
-            continue;
-        }
-
-        for (NSDictionary<NSString *, id> *link in source[@"links"]) {
-            NSURL *url = [NSURL URLWithString:link[@"url"]];
-            if ([hostsNeedingAuth containsObject:url.host]) {
-                DBGLOG("Skipping link that needs authentication: %s\n", url.absoluteString.UTF8String);
-                continue;
-            }
-
-            if (!link[@"active"]) {
-                DBGLOG("Skipping inactive link: %s\n", url.absoluteString.UTF8String);
-                continue;
-            }
-
-            if (isOTA) {
-                *isOTA = [source[@"type"] isEqualToString:@"ota"];
-            }
-
-            NSString *finalURL = proxyFirmwareURL(link[@"url"]);
-            LOG("Found firmware URL: %s (OTA: %s)\n", finalURL.UTF8String, *isOTA ? "yes" : "no");
-            return finalURL;
-        }
-
-        DBGLOG("No suitable links found for source: %s\n", [source[@"name"] UTF8String]);
+static NSString *getIndexURLForModel(NSString *modelIdentifier) {
+    if ([modelIdentifier hasPrefix:@"iPhone"]) {
+        return INDEX_IPHONE;
+    } else if ([modelIdentifier hasPrefix:@"iPad"]) {
+        return INDEX_IPAD;
     }
-
     return nil;
-}
-
-static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSError *error = nil;
-    NSData *compressed = makeSynchronousRequest(ALL_VERSIONS, &error);
-    if (error) {
-        ERRLOG("Failed to fetch API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-
-    NSData *decompressed = [compressed decompressedDataUsingAlgorithm:NSDataCompressionAlgorithmLZMA error:&error];
-    if (error) {
-        ERRLOG("Failed to decompress API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-
-    NSArray *json = [NSJSONSerialization JSONObjectWithData:decompressed options:0 error:&error];
-    if (error) {
-        ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-
-    for (NSDictionary<NSString *, id> *firmware in json) {
-        if ([firmware[@"osStr"] isEqualToString:osStr] && [firmware[@"build"] isEqualToString:build]) {
-            NSString *firmwareURL = bestLinkFromSources(firmware[@"sources"], modelIdentifier, isOTA);
-            if (!firmwareURL) {
-                DBGLOG("No suitable links found for firmware: %s\n", [firmware[@"key"] UTF8String]);
-            } else {
-                return firmwareURL;
-            }
-        }
-    }
-
-    return nil;
-}
-
-static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *apiURL = apiURLForBuild(osStr, build);
-    if (!apiURL) {
-        ERRLOG("Failed to get API URL!\n");
-        return nil;
-    }
-
-    NSError *error = nil;
-    NSData *data = makeSynchronousRequest(apiURL, &error);
-    if (error) {
-        ERRLOG("Failed to fetch API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-    if (error) {
-        ERRLOG("Failed to parse API data: %s\n", error.localizedDescription.UTF8String);
-        return nil;
-    }
-
-    NSString *firmwareURL = bestLinkFromSources(json[@"sources"], modelIdentifier, isOTA);
-    if (!firmwareURL) {
-        return nil;
-    }
-
-    return firmwareURL;
 }
 
 NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *firmwareURL = getFirmwareURLFromDirect(osStr, build, modelIdentifier, isOTA);
-    if (!firmwareURL) {
-        DBGLOG("Failed to get firmware URL from direct API, checking all versions...\n");
-        firmwareURL = getFirmwareURLFromAll(osStr, build, modelIdentifier, isOTA);
-    }
-
-    if (!firmwareURL) {
-        ERRLOG("Failed to find a firmware URL!\n");
+    NSString *indexURL = getIndexURLForModel(modelIdentifier);
+    if (!indexURL) {
+        ERRLOG("Unsupported device model: %s\n", modelIdentifier.UTF8String);
         return nil;
     }
 
-    return firmwareURL;
+    LOG("Fetching index from mirror: %s\n", indexURL.UTF8String);
+
+    NSError *error = nil;
+    NSData *data = fetchJSONSync(indexURL, &error);
+    if (error || !data) {
+        ERRLOG("Failed to fetch index: %s\n", error.localizedDescription.UTF8String);
+        return nil;
+    }
+
+    NSArray *index = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (error || ![index isKindOfClass:[NSArray class]]) {
+        ERRLOG("Failed to parse index JSON: %s\n", error.localizedDescription.UTF8String);
+        return nil;
+    }
+
+    LOG("Index loaded, %lu entries. Searching for model=%s build=%s\n",
+        (unsigned long)index.count, modelIdentifier.UTF8String, build.UTF8String);
+
+    for (NSDictionary *entry in index) {
+        if ([entry[@"model"] isEqualToString:modelIdentifier] &&
+            [entry[@"build"] isEqualToString:build]) {
+            NSString *url = entry[@"url"];
+            LOG("Found kernelcache: %s (%s)\n", modelIdentifier.UTF8String, entry[@"version"].UTF8String);
+            if (isOTA) *isOTA = NO;
+            return url;
+        }
+    }
+
+    ERRLOG("No matching kernelcache found for model=%s build=%s\n",
+           modelIdentifier.UTF8String, build.UTF8String);
+    return nil;
 }
 
 NSString *getFirmwareURL(bool *isOTA) {
@@ -213,6 +98,8 @@ NSString *getFirmwareURL(bool *isOTA) {
     NSString *modelIdentifier = getModelIdentifier();
 
     if (!osStr || !build || !modelIdentifier) {
+        ERRLOG("Failed to get device info! osStr=%s build=%s model=%s\n",
+               osStr.UTF8String ?: "nil", build.UTF8String ?: "nil", modelIdentifier.UTF8String ?: "nil");
         return nil;
     }
 
