@@ -14,7 +14,7 @@
 #include "appledb.h"
 #include "utils.h"
 
-static bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
+bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
     NSError *error = nil;
     NSString *pathPrefix = isOTA ? @"AssetData/boot" : @"";
 
