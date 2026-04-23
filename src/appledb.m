@@ -55,40 +55,40 @@ static NSString *getIndexURLForModel(NSString *modelIdentifier) {
 NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
     NSString *indexURL = getIndexURLForModel(modelIdentifier);
     if (!indexURL) {
-        ERRLOG("Unsupported device model: %s\n", modelIdentifier.UTF8String);
+        ERRLOG("不支持的设备型号: %s\n", modelIdentifier.UTF8String);
         return nil;
     }
 
-    LOG("Fetching index from mirror: %s\n", indexURL.UTF8String);
+    LOG("正在获取内核缓存索引...\n");
 
     NSError *error = nil;
     NSData *data = fetchJSONSync(indexURL, &error);
     if (error || !data) {
-        ERRLOG("Failed to fetch index: %s\n", error.localizedDescription.UTF8String);
+        ERRLOG("获取索引失败: %s\n", error.localizedDescription.UTF8String);
         return nil;
     }
 
     NSArray *index = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
     if (error || ![index isKindOfClass:[NSArray class]]) {
-        ERRLOG("Failed to parse index JSON: %s\n", error.localizedDescription.UTF8String);
+        ERRLOG("解析索引失败: %s\n", error.localizedDescription.UTF8String);
         return nil;
     }
 
-    LOG("Index loaded, %lu entries. Searching for model=%s build=%s\n",
-        (unsigned long)index.count, modelIdentifier.UTF8String, build.UTF8String);
+    LOG("正在搜索内核缓存 (build %s)...\n", build.UTF8String);
 
     for (NSDictionary *entry in index) {
         if ([entry[@"model"] isEqualToString:modelIdentifier] &&
             [entry[@"build"] isEqualToString:build]) {
-        NSString *url = (NSString *)entry[@"url"];
-        NSString *version = (NSString *)entry[@"version"];
-        LOG("Found kernelcache: %s (%s)\n", modelIdentifier.UTF8String, version.UTF8String);
-        if (isOTA) *isOTA = NO;
-        return url;
+            NSString *url = (NSString *)entry[@"url"];
+            NSString *version = (NSString *)entry[@"version"];
+            LOG("找到内核缓存: iOS %s (%.1f MB)\n",
+                version.UTF8String, [entry[@"size"] doubleValue] / 1024.0 / 1024.0);
+            if (isOTA) *isOTA = NO;
+            return url;
         }
     }
 
-    ERRLOG("No matching kernelcache found for model=%s build=%s\n",
+    ERRLOG("未找到匹配的内核缓存 (型号=%s build=%s)\n",
            modelIdentifier.UTF8String, build.UTF8String);
     return nil;
 }
@@ -99,7 +99,7 @@ NSString *getFirmwareURL(bool *isOTA) {
     NSString *modelIdentifier = getModelIdentifier();
 
     if (!osStr || !build || !modelIdentifier) {
-        ERRLOG("Failed to get device info! osStr=%s build=%s model=%s\n",
+        ERRLOG("获取设备信息失败! osStr=%s build=%s model=%s\n",
                osStr.UTF8String ?: "nil", build.UTF8String ?: "nil", modelIdentifier.UTF8String ?: "nil");
         return nil;
     }

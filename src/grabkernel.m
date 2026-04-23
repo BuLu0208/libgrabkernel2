@@ -3,7 +3,7 @@
 //  libgrabkernel2
 //
 //  Created by Alfie on 14/02/2024.
-//  Modified: 支持 GitHub Release 镜像直接下载 kernelcache 文件
+//  Modified: 支持 GitHub Release 镜像直接下载 kernelcache 文件，带进度显示
 //
 
 #include "grabkernel.h"
@@ -14,99 +14,148 @@
 #include "appledb.h"
 #include "utils.h"
 
-// GitHub 镜像直接下载 .kernelcache 文件
+#pragma mark - Download Progress Delegate
+
+@interface _KCDownloadDelegate : NSObject <NSURLSessionDataDelegate>
+@property (nonatomic, strong) NSMutableData *data;
+@property (nonatomic, assign) long long expectedLength;
+@property (nonatomic, assign) long long receivedLength;
+@property (nonatomic, strong) NSError *error;
+@property (nonatomic, assign) int lastLoggedPct;
+@end
+
+@implementation _KCDownloadDelegate
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _data = [NSMutableData data];
+        _lastLoggedPct = -1;
+    }
+    return self;
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    long long length = response.expectedContentLength;
+    if (length > 0) {
+        _expectedLength = length;
+        LOG("下载大小: %.1f MB\n", length / 1024.0 / 1024.0);
+    }
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)chunk {
+    [_data appendData:chunk];
+    _receivedLength += chunk.length;
+
+    if (_expectedLength > 0) {
+        int pct = (int)((double)_receivedLength / _expectedLength * 100);
+        // Log every 5% to avoid spam
+        if (pct / 5 != _lastLoggedPct / 5 || pct == 100) {
+            _lastLoggedPct = pct;
+            int barCount = pct / 5;
+            char bar[22];
+            memset(bar, '=', barCount);
+            bar[barCount] = '\0';
+            LOG("正在下载内核缓存... [%-20s] %d%%\n", bar, pct);
+        }
+    }
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    _error = error;
+}
+
+@end
+
+#pragma mark - Direct Download (GitHub Mirror)
+
 static bool downloadKernelcacheDirect(NSString *url, NSString *outPath) {
     if (!url || !outPath) {
-        ERRLOG("Missing URL or output path!\n");
+        ERRLOG("缺少下载地址或输出路径!\n");
         return false;
     }
 
     if (![[NSFileManager defaultManager] isWritableFileAtPath:outPath.stringByDeletingLastPathComponent]) {
-        ERRLOG("Output directory is not writable!\n");
+        ERRLOG("输出目录不可写!\n");
         return false;
     }
 
-    LOG("Downloading kernelcache: %s\n", url.UTF8String);
-    LOG("Saving to: %s\n", outPath.UTF8String);
+    LOG("开始下载内核缓存...\n");
 
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-    __block NSData *data = nil;
-    __block NSError *taskError = nil;
+
+    _KCDownloadDelegate *delegate = [[_KCDownloadDelegate alloc] init];
 
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
     config.timeoutIntervalForRequest = 60;
     config.timeoutIntervalForResource = 600;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:delegate delegateQueue:nil];
 
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
     [request setValue:@"libgrabkernel2-mirror/3.0" forHTTPHeaderField:@"User-Agent"];
 
-    NSURLSessionDataTask *task = [session dataTaskWithURL:[NSURL URLWithString:url]
-                                        completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
-                                            data = taskData;
-                                            taskError = error;
-                                            dispatch_semaphore_signal(semaphore);
-                                        }];
-    [task resume];
+    [[session dataTaskWithRequest:request completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *error) {
+        dispatch_semaphore_signal(semaphore);
+    }] resume];
+
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    [session invalidateAndCancel];
 
-    if (taskError || !data) {
-        ERRLOG("Failed to download kernelcache: %s\n", taskError.localizedDescription.UTF8String);
-        return false;
-    }
-
-    if (data.length < 1024 * 100) {
-        ERRLOG("Downloaded file too small: %lu bytes\n", (unsigned long)data.length);
+    if (delegate.error || delegate.data.length < 1024 * 100) {
+        ERRLOG("下载内核缓存失败: %s\n",
+               delegate.error ? delegate.error.localizedDescription.UTF8String : "文件过小");
         return false;
     }
 
     NSError *writeError = nil;
-    if (![data writeToFile:outPath options:NSDataWritingAtomic error:&writeError]) {
-        ERRLOG("Failed to write kernelcache: %s\n", writeError.localizedDescription.UTF8String);
+    if (![delegate.data writeToFile:outPath options:NSDataWritingAtomic error:&writeError]) {
+        ERRLOG("写入内核缓存失败: %s\n", writeError.localizedDescription.UTF8String);
         return false;
     }
 
-    LOG("Downloaded kernelcache! Size: %.1f MB\n", data.length / 1024.0 / 1024.0);
+    LOG("内核缓存下载完成! (%.1f MB)\n", delegate.data.length / 1024.0 / 1024.0);
     return true;
 }
 
-// Partial ZIP 方式从 IPSW 提取 kernelcache（兼容旧逻辑）
+#pragma mark - Partial ZIP Download (Legacy IPSW)
+
 static bool downloadKernelcacheFromIPSW(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
     NSError *error = nil;
     NSString *pathPrefix = isOTA ? @"AssetData/boot" : @"";
 
     if (!zipURL) {
-        ERRLOG("Missing firmware URL!\n");
+        ERRLOG("缺少固件地址!\n");
         return false;
     }
 
     if (!outPath) {
-        ERRLOG("Missing output path!\n");
+        ERRLOG("缺少输出路径!\n");
         return false;
     }
 
     if (![[NSFileManager defaultManager] isWritableFileAtPath:outPath.stringByDeletingLastPathComponent]) {
-        ERRLOG("Output directory is not writable!\n");
+        ERRLOG("输出目录不可写!\n");
         return false;
     }
 
     Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:zipURL] error:&error];
     if (!zip) {
-        ERRLOG("Failed to open zip file! %s\n", error.localizedDescription.UTF8String);
+        ERRLOG("打开固件文件失败! %s\n", error.localizedDescription.UTF8String);
         return false;
     }
 
-    LOG("Downloading BuildManifest.plist...\n");
+    LOG("正在下载 BuildManifest.plist...\n");
 
     NSData *buildManifestData = [zip getFileForPath:[pathPrefix stringByAppendingPathComponent:@"BuildManifest.plist"] error:&error];
     if (!buildManifestData) {
-        ERRLOG("Failed to download BuildManifest.plist! %s\n", error.localizedDescription.UTF8String);
+        ERRLOG("下载 BuildManifest.plist 失败! %s\n", error.localizedDescription.UTF8String);
         return false;
     }
 
     NSDictionary *buildManifest = [NSPropertyListSerialization propertyListWithData:buildManifestData options:0 format:NULL error:&error];
     if (error) {
-        ERRLOG("Failed to parse BuildManifest.plist! %s\n", error.localizedDescription.UTF8String);
+        ERRLOG("解析 BuildManifest.plist 失败! %s\n", error.localizedDescription.UTF8String);
         return false;
     }
 
@@ -122,34 +171,33 @@ static bool downloadKernelcacheFromIPSW(NSString *boardconfig, NSString *zipURL,
     }
 
     if (!kernelCachePath) {
-        ERRLOG("Failed to find kernelcache path in BuildManifest.plist!\n");
+        ERRLOG("在 BuildManifest.plist 中未找到内核缓存路径!\n");
         return false;
     }
 
-    LOG("Downloading %s to %s...\n", kernelCachePath.UTF8String, outPath.UTF8String);
+    LOG("正在下载 %s...\n", kernelCachePath.UTF8String);
 
     NSData *kernelCacheData = [zip getFileForPath:kernelCachePath error:&error];
     if (!kernelCacheData) {
-        ERRLOG("Failed to download kernelcache! %s\n", error.localizedDescription.UTF8String);
+        ERRLOG("下载内核缓存失败! %s\n", error.localizedDescription.UTF8String);
         return false;
-    } else {
-        LOG("Downloaded kernelcache!\n");
     }
 
     if (![kernelCacheData writeToFile:outPath options:NSDataWritingAtomic error:&error]) {
-        ERRLOG("Failed to write kernelcache to %s! %s\n", outPath.UTF8String, error.localizedDescription.UTF8String);
+        ERRLOG("写入内核缓存失败 %s! %s\n", outPath.UTF8String, error.localizedDescription.UTF8String);
         return false;
     }
 
+    LOG("内核缓存下载完成! (%.1f MB)\n", kernelCacheData.length / 1024.0 / 1024.0);
     return true;
 }
 
+#pragma mark - Public API
+
 bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
-    // 如果 URL 是 .kernelcache 结尾，直接下载
     if ([zipURL hasSuffix:@".kernelcache"]) {
         return downloadKernelcacheDirect(zipURL, outPath);
     }
-    // 否则走 Partial ZIP（兼容旧逻辑）
     return downloadKernelcacheFromIPSW(boardconfig, zipURL, isOTA, outPath);
 }
 
@@ -157,7 +205,7 @@ bool download_kernelcache(NSString *zipURL, bool isOTA, NSString *outPath) {
     NSString *boardconfig = getBoardconfig();
 
     if (!boardconfig) {
-        ERRLOG("Failed to get boardconfig!\n");
+        ERRLOG("获取 boardconfig 失败!\n");
         return false;
     }
 
@@ -168,7 +216,7 @@ bool grab_kernelcache_for(NSString *osStr, NSString *build, NSString *modelIdent
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURLFor(osStr, build, modelIdentifier, &isOTA);
     if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL!\n");
+        ERRLOG("获取固件地址失败!\n");
         return false;
     }
 
@@ -179,7 +227,7 @@ bool grab_kernelcache(NSString *outPath) {
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURL(&isOTA);
     if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL!\n");
+        ERRLOG("获取固件地址失败!\n");
         return false;
     }
 
@@ -190,7 +238,7 @@ bool grab_kernelcache_for_build_number(NSString *build, NSString *outPath) {
     bool isOTA = NO;
     NSString *firmwareURL = getFirmwareURLFor(getOsStr(), build, getModelIdentifier(), &isOTA);
     if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL for build number: %s\n", build.UTF8String);
+        ERRLOG("获取固件地址失败 (build: %s)\n", build.UTF8String);
         return false;
     }
 
