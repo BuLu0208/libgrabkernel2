@@ -3,7 +3,7 @@
 //  libgrabkernel2
 //
 //  Created by Alfie on 14/02/2024.
-//  Modified: 支持 GitHub Release 镜像直接下载 kernelcache 文件
+//  Modified: 所有请求走 CF Worker 代理，通过 Partial ZIP 从 IPSW 提取 kernelcache
 //
 
 #include "grabkernel.h"
@@ -33,54 +33,15 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
-    // .kernelcache ending = direct file download from mirror
-    if ([zipURL hasSuffix:@".kernelcache"]) {
-        LOG("Downloading kernelcache from mirror...\n");
-
-        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-        __block NSData *data = nil;
-        __block NSError *taskError = nil;
-
-        NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-        config.timeoutIntervalForRequest = 60;
-        config.timeoutIntervalForResource = 600;
-        NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-
-        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:zipURL]];
-        [request setValue:@"libgrabkernel2-mirror/3.0" forHTTPHeaderField:@"User-Agent"];
-
-        [[session dataTaskWithRequest:request completionHandler:^(NSData *taskData, NSURLResponse *response, NSError *err) {
-            data = taskData;
-            taskError = err;
-            dispatch_semaphore_signal(semaphore);
-        }] resume];
-
-        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-
-        if (taskError || !data || data.length < 1024 * 100) {
-            ERRLOG("Failed to download kernelcache: %s\n",
-                   taskError ? taskError.localizedDescription.UTF8String : "file too small");
-            return false;
-        }
-
-        NSError *writeError = nil;
-        if (![data writeToFile:outPath options:NSDataWritingAtomic error:&writeError]) {
-            ERRLOG("Failed to write kernelcache: %s\n", writeError.localizedDescription.UTF8String);
-            return false;
-        }
-
-        LOG("Downloaded kernelcache! (%.1f MB)\n", data.length / 1024.0 / 1024.0);
-        return true;
-    }
-
-    // Otherwise use Partial ZIP to extract from IPSW
+    // 通过 Worker 代理打开 IPSW（ZIP），Partial ZIP 用 Range 请求提取文件
+    LOG("正在打开 IPSW...\n");
     Partial *zip = [Partial partialZipWithURL:[NSURL URLWithString:zipURL] error:&error];
     if (!zip) {
         ERRLOG("Failed to open zip file! %s\n", error.localizedDescription.UTF8String);
         return false;
     }
 
-    LOG("Downloading BuildManifest.plist...\n");
+    LOG("正在下载 BuildManifest.plist...\n");
 
     NSData *buildManifestData = [zip getFileForPath:[pathPrefix stringByAppendingPathComponent:@"BuildManifest.plist"] error:&error];
     if (!buildManifestData) {
@@ -94,6 +55,7 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
+    // 用 boardconfig 精确匹配 DeviceClass，跳过 Research 变体
     NSString *kernelCachePath = nil;
 
     for (NSDictionary<NSString *, id> *identity in buildManifest[@"BuildIdentities"]) {
@@ -110,14 +72,12 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
-    LOG("Downloading %s to %s...\n", kernelCachePath.UTF8String, outPath.UTF8String);
+    LOG("正在提取 %s ...\n", kernelCachePath.UTF8String);
 
     NSData *kernelCacheData = [zip getFileForPath:kernelCachePath error:&error];
     if (!kernelCacheData) {
         ERRLOG("Failed to download kernelcache! %s\n", error.localizedDescription.UTF8String);
         return false;
-    } else {
-        LOG("Downloaded kernelcache!\n");
     }
 
     if (![kernelCacheData writeToFile:outPath options:NSDataWritingAtomic error:&error]) {
@@ -125,6 +85,7 @@ bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOT
         return false;
     }
 
+    LOG("Kernelcache 提取成功! (%.1f MB)\n", kernelCacheData.length / 1024.0 / 1024.0);
     return true;
 }
 
