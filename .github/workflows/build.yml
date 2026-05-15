@@ -1,0 +1,38 @@
+name: Build libgrabkernel2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build for iOS
+        run: |
+          # ldid for code signing
+          brew install ldid
+          
+          # Build static library
+          make TARGET=ios DISABLE_TESTS=1
+          
+          # Show result
+          ls -la output/ios/lib/
+          file output/ios/lib/libgrabkernel2.a
+          lipo -info output/ios/lib/libgrabkernel2.a
+
+      - name: Upload libgrabkernel2.a
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgrabkernel2-ios
+          path: output/ios/lib/libgrabkernel2.a
+          retention-days: 30
+
+      - name: Upload headers
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgrabkernel2-headers
+          path: output/ios/include/
+          retention-days: 30
